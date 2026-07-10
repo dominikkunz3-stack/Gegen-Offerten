@@ -115,46 +115,51 @@
       URL.revokeObjectURL(url);
     }
 
-    /* ---- Competitor text parser (Sabag/Richner Tabellenformat) ----
-       Spaltenstruktur:
-       Art.-Nr. | Artikelbezeichnung | Farbe/Ausführung | Grösse/Masse | Preis CHF exkl. Mwst | Menge | Betrag CHF
-       Zeilenmuster: "111481 Badewanne Cayono 100 weiss 751.00 1 751.00"
+    /* ---- Competitor text parser (Sabag/Richner) ----
+       Format: ArtNr Bezeichnung Farbe Grösse Preis Menge Betrag
+       Von rechts: Betrag Menge Preis extrahieren
     ---- */
     function parseCompetitorText(text) {
       const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
       const rows = [];
-
-      // Sabag/Richner: Zeile beginnt mit 6-stelliger Art.-Nr., dann Bezeichnung, am Ende: Preis Menge Betrag
-      // z.B.: "111481 Badewanne Cayono 100 weiss 751.00 1 751.00"
-      // Muster: ARTNR  BEZEICHNUNG ... PREIS  MENGE  BETRAG
-      const sabagRe = /^(\d{5,7})\s+(.+?)\s+([\d']+\.?\d*)\s+(\d{1,4})\s+([\d']+\.?\d*)$/;
-      // Fallback: Zeile beginnt mit Art.-Nr. und hat mindestens Preis + Menge
-      const sabagSimple = /^(\d{5,7})\s+(.+?)\s+([\d']+\.?\d*)\s+(\d{1,4})/;
-
-      // Mehrzeilige Bezeichnung: Ausführungszeile (z.B. "183  standard  150 x 41 x 70")
-      const ausfRe = /^(\d{1,4})\s+(standard|spezial|ohne Farbe|verchromt|chromeline|[a-zA-ZäöüÄÖÜ\s]+)\s*(.*)$/i;
-
       let lastRow = null;
-
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
-
-        // Kopfzeile und Summenzeilen überspringen
-        if (/^Art\.-?Nr\.|^Artikel|^Total|^Mwst|^Seite:|^Objekt:|^Datum:|^Projekt/i.test(line)) continue;
-
-        const m = line.match(sabagRe) || line.match(sabagSimple);
-        if (m) {
-          const sgvsbNr = m[1];
-          const bezeichnung = m[2].trim();
-          // Bei sabagRe: m[3]=Preis, m[4]=Menge; bei sabagSimple ebenfalls
-          const konkurrenzPreis = m[3].replace(/'/g, "");
-          const menge = Number(m[4]) || 1;
-
-          const row = { ...emptyRow(), sgvsbNr, bezeichnung, menge, konkurrenzPreis, stNr: "", preis: 0 };
-          rows.push(row);
-          lastRow = row;
+        if (/^Art\.\-?Nr\.|^Artikel|^Total|^Mwst|^Seite:|^Objekt:|^Datum:|^Projekt|^Preis CHF/i.test(line)) continue;
+        const artM = line.match(/^(\d{5,7})\s+(.+)$/);
+        if (!artM) {
+          if (lastRow && /^\d{1,4}\s/.test(line) && !/^\d{5,7}/.test(line)) {
+            lastRow.bezeichnung += " \u2013 " + line.replace(/\s+/g, " ").trim();
+          }
           continue;
         }
+        const sgvsbNr = artM[1];
+        const rest = artM[2].trim();
+        let konkurrenzPreis = "", menge = 1, bezeichnung = rest;
+        // Von rechts: Preis(X.XX) Menge(1-4 Stellen) Betrag(X.XX)
+        const tokens = rest.split(/\s+/);
+        const n = tokens.length;
+        if (n >= 3) {
+          const t1 = tokens[n-1], t2 = tokens[n-2], t3 = tokens[n-3];
+          const isPrice = s => /^[\d\']+\.\d{2}$/.test(s);
+          const isQty = s => /^\d{1,4}$/.test(s) && Number(s) <= 9999;
+          if (isPrice(t1) && isQty(t2) && isPrice(t3)) {
+            // t3=Preis t2=Menge t1=Betrag
+            konkurrenzPreis = t3.replace(/\'/g, "");
+            menge = Number(t2) || 1;
+            bezeichnung = tokens.slice(0, n-3).join(" ");
+          } else if (isPrice(t1) && isQty(t2)) {
+            konkurrenzPreis = t1.replace(/\'/g, "");
+            menge = Number(t2) || 1;
+            bezeichnung = tokens.slice(0, n-2).join(" ");
+          }
+        }
+        const row = { ...emptyRow(), sgvsbNr, bezeichnung, menge, konkurrenzPreis, stNr: "", preis: 0 };
+        rows.push(row);
+        lastRow = row;
+      }
+      return rows;
+    }
 
         // Ausführungs-Zusatzzeile zur vorherigen Position anhängen
         if (lastRow && ausfRe.test(line)) {
