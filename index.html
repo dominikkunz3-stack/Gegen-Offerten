@@ -300,32 +300,78 @@ async function handlePdf(input){
 
 function parseCompetitorText(text){
   const lines=text.split('\n').map(l=>l.trim()).filter(Boolean);
-  const result=[];let lastRow=null;
+  const result=[];
+  const isPrice=s=>/^[\d']+\.\d{2}$/.test(s);
+  const isQty=s=>/^\d{1,4}$/.test(s)&&Number(s)<=9999;
+
+  // Sabag/Richner PDF: Art-Nr + Bezeichnung auf einer Zeile,
+  // Preis + Menge + Betrag können auf gleicher ODER nächster Zeile stehen
   for(let i=0;i<lines.length;i++){
     const line=lines[i];
-    if(/^Art\.?\-?Nr\.|^Artikel|^Total|^Mwst|^Seite:|^Objekt:|^Datum:|^Projekt|^Preis CHF/i.test(line))continue;
+    if(/^Art\.?-?Nr\.|^Artikel|^Total|^Mwst|^Seite:|^Objekt:|^Datum:|^Projekt|^Preis CHF|^Ausführung|^Farbe|^Grösse/i.test(line))continue;
+
     const artM=line.match(/^(\d{5,7})\s+(.+)$/);
-    if(!artM){
-      if(lastRow&&/^\d{1,4}\s/.test(line)&&!/^\d{5,7}/.test(line)){
-        lastRow.bezeichnung+=' \u2013 '+line.replace(/\s+/g,' ').trim();
-      }
-      continue;
-    }
-    const sgvsbNr=artM[1],rest=artM[2].trim();
+    if(!artM) continue;
+
+    const sgvsbNr=artM[1];
+    let rest=artM[2].trim();
+    let tokens=rest.split(/\s+/),n=tokens.length;
     let konkurrenzPreis='',menge=1,bezeichnung=rest;
-    const tokens=rest.split(/\s+/),n=tokens.length;
-    const isPrice=s=>/^[\d']+\.\d{2}$/.test(s);
-    const isQty=s=>/^\d{1,4}$/.test(s)&&Number(s)<=9999;
+
+    // Prüfe ob Preis/Menge/Betrag am Ende dieser Zeile
     if(n>=3&&isPrice(tokens[n-1])&&isQty(tokens[n-2])&&isPrice(tokens[n-3])){
-      konkurrenzPreis=tokens[n-3].replace(/'/g,'');menge=Number(tokens[n-2])||1;bezeichnung=tokens.slice(0,n-3).join(' ');
-    }else if(n>=2&&isPrice(tokens[n-1])&&isQty(tokens[n-2])){
-      konkurrenzPreis=tokens[n-1].replace(/'/g,'');menge=Number(tokens[n-2])||1;bezeichnung=tokens.slice(0,n-2).join(' ');
+      konkurrenzPreis=tokens[n-3].replace(/'/g,'');
+      menge=Number(tokens[n-2])||1;
+      bezeichnung=tokens.slice(0,n-3).join(' ');
+    } else if(n>=2&&isPrice(tokens[n-1])&&isQty(tokens[n-2])){
+      konkurrenzPreis=tokens[n-1].replace(/'/g,'');
+      menge=Number(tokens[n-2])||1;
+      bezeichnung=tokens.slice(0,n-2).join(' ');
+    } else {
+      // Preis/Menge/Betrag auf nächsten Zeilen suchen (max 3 Zeilen voraus)
+      let found=false;
+      for(let j=i+1;j<=Math.min(i+3,lines.length-1);j++){
+        const next=lines[j].trim();
+        // Muster: "751.00 1 751.00" oder "751.00 1" oder nur "751.00"
+        const pm3=next.match(/^([\d']+\.\d{2})\s+(\d{1,4})\s+[\d']+\.\d{2}$/);
+        const pm2=next.match(/^([\d']+\.\d{2})\s+(\d{1,4})$/);
+        const pm1=next.match(/^([\d']+\.\d{2})$/);
+        if(pm3){
+          konkurrenzPreis=pm3[1].replace(/'/g,'');
+          menge=Number(pm3[2])||1;
+          found=true;break;
+        } else if(pm2){
+          konkurrenzPreis=pm2[1].replace(/'/g,'');
+          menge=Number(pm2[2])||1;
+          found=true;break;
+        } else if(pm1&&!found){
+          // Nur Preis gefunden, Menge bleibt 1
+          konkurrenzPreis=pm1[1].replace(/'/g,'');
+          found=true;
+          // Weitersuchen nach Menge auf nächster Zeile
+          if(j+1<lines.length){
+            const nextNext=lines[j+1].trim();
+            if(isQty(nextNext)){menge=Number(nextNext)||1;}
+          }
+          break;
+        }
+      }
+      bezeichnung=rest;
     }
+
+    // Bezeichnung bereinigen: trailing "0 ohne Farbe", "100 weiss" etc. entfernen
+    // aber nur wenn Preis gefunden wurde
+    if(konkurrenzPreis){
+      bezeichnung=bezeichnung.replace(/\s+\d+\s+(ohne Farbe|weiss|schwarz|verchromt|chromeline|[a-z]+).*$/i,'').trim();
+      bezeichnung=bezeichnung.replace(/\s+\d+$/, '').trim();
+    }
+
     const row={...emptyRow(),sgvsbNr,bezeichnung,menge,konkurrenzPreis,stNr:'',preis:0};
-    applyMap(row);result.push(row);lastRow=row;
+    applyMap(row);result.push(row);
   }
   return result;
 }
+
 
 // Image
 function handleImg(id,input){
