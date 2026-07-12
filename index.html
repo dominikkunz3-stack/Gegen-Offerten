@@ -155,7 +155,16 @@ function updateField(id,field,val){
 }
 
 function applyMap(row){
-  if(row.sgvsbNr&&mapping[row.sgvsbNr])row.stNr=mapping[row.sgvsbNr];
+  const m=mapping[row.sgvsbNr];
+  if(m){
+    if(typeof m==='object'){
+      if(m.stNr) row.stNr=m.stNr;
+      if(m.preis&&row.preis===0) row.preis=Number(m.preis)||0;
+      if(m.bezeichnung&&!row.bezeichnung) row.bezeichnung=m.bezeichnung;
+    } else {
+      row.stNr=m;
+    }
+  }
   return row;
 }
 
@@ -235,9 +244,18 @@ async function handleMapping(input){
   let ti=header.findIndex(h=>h.includes('st')||h.includes('trösch')||h.includes('troesch'));
   let data=si!==-1&&ti!==-1?table.slice(1):(si=0,ti=1,table);
   mapping={};let cnt=0;
-  data.forEach(r=>{const sg=(r[si]||'').trim(),st=(r[ti]||'').trim();if(sg&&st){mapping[sg]=st;cnt++;}});
-  rows.forEach(applyMap);
-  renderRows();
+  // Suche auch Preis-Spalte
+  const pi=header.findIndex(h=>h.includes('preis')||h.includes('chf'));
+  const bi=header.findIndex(h=>h.includes('bezeichnung')||h.includes('beschreibung'));
+  data.forEach(r=>{
+    const sg=(r[si]||'').trim(),st=(r[ti]||'').trim();
+    if(sg&&st){
+      mapping[sg]={stNr:st,preis:(r[pi]||'').trim().replace(/'/g,'').replace(',','.'),bezeichnung:(r[bi]||'').trim()};
+      cnt++;
+    }
+  });
+  rows.forEach(r=>{applyMap(r);});
+  renderRows();updateTotals();
   document.getElementById('mapStatus').textContent=`✓ ${cnt} Zuordnungen aus "${file.name}"`;
   document.getElementById('mapStatus').style.color='#3E6B4F';
   input.value='';
