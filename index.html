@@ -333,8 +333,15 @@ async function handlePdf(input){
       if(buf.length)lines.push(buf.join(' '));
       fullText+=lines.join('\n')+'\n';
     }
+    // DEBUG
+    console.log('=== PDF RAW TEXT (erste 5000) ===');
+    console.log(fullText.substring(0,5000));
     const imported=parseCompetitorText(fullText);
-    if(!imported.length)throw new Error('Keine Positionen erkannt.');
+    if(!imported.length){
+      const preview = fullText.substring(0,1000).replace(/\n/g,' ⏎ ');
+      flash('Keine Positionen. Text-Preview: ' + preview, 30000);
+      throw new Error('Keine Positionen erkannt.');
+    }
     const base=rows.length===1&&!rows[0].sgvsbNr&&!rows[0].bezeichnung?[]:rows;
     rows=[...base,...imported];
     renderRows();updateTotals();
