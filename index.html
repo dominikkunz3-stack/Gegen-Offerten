@@ -38,6 +38,22 @@
   </style>
 </head>
 <body>
+  <!-- Suchmodal -->
+  <div id="searchModal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:1000;overflow-y:auto">
+    <div style="background:#fff;margin:40px auto;max-width:700px;border-radius:6px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,0.3)">
+      <div style="background:#101F2B;padding:16px 20px;display:flex;justify-content:space-between;align-items:center">
+        <span style="color:#F4F1EA;font-family:'Archivo',sans-serif;font-weight:700;font-size:15px">Sanitas Trösch Artikel suchen</span>
+        <button onclick="closeSearch()" style="background:none;border:none;color:#B98A4E;font-size:22px;cursor:pointer">×</button>
+      </div>
+      <div style="padding:16px">
+        <input id="searchInput" placeholder="Artikelname oder ST-Nr. eingeben..." 
+          style="width:100%;padding:10px 12px;border:1px solid #D8D2C2;border-radius:3px;font-size:14px;margin-bottom:12px"
+          oninput="doSearch(this.value)">
+        <div id="searchResults" style="max-height:400px;overflow-y:auto"></div>
+      </div>
+    </div>
+  </div>
+
   <!-- Header -->
   <div style="background:#101F2B;padding:20px 28px;border-bottom:3px solid #B98A4E">
     <span style="font-family:'Archivo',sans-serif;font-weight:800;font-size:22px;color:#F4F1EA">SANITAS TRÖSCH</span>
@@ -189,7 +205,15 @@ function renderRows(){
           <input type="file" id="img_${row.id}" accept="image/*" style="display:none" onchange="handleImg('${row.id}',this)">
         </div>
       </td>
-      <td><input value="${esc(row.stNr)}" placeholder="1111693.100" onchange="updateField('${row.id}','stNr',this.value)"></td>
+      <td>
+        <div style="display:flex;gap:4px;align-items:center">
+          <input value="${esc(row.stNr)}" placeholder="1111693.100" onchange="updateField('${row.id}','stNr',this.value)" style="min-width:90px">
+          <button onclick="${row.stNr ? 'openSearch' : 'autoSuggest'}('${row.id}')" 
+            title="${row.stNr ? 'Sanitas Artikel suchen' : 'KI-Vorschläge laden'}"
+            style="background:${row.stNr ? '#D8D2C2' : '#B98A4E'};border:none;color:${row.stNr ? '#101F2B' : '#fff'};border-radius:3px;padding:5px 7px;font-size:11px;white-space:nowrap;cursor:pointer">
+            ${row.stNr ? '🔍' : '🤖'}</button>
+        </div>
+      </td>
       <td><input value="${esc(row.sgvsbNr)}" placeholder="111111" onchange="updateField('${row.id}','sgvsbNr',this.value)"></td>
       <td><input value="${esc(row.bezeichnung)}" onchange="updateField('${row.id}','bezeichnung',this.value)"></td>
       <td><input type="number" min="0" value="${row.menge}" onchange="updateField('${row.id}','menge',this.value)"></td>
@@ -321,38 +345,96 @@ async function handlePdf(input){
 
 function parseCompetitorText(text){
   const lines=text.split('\n').map(l=>l.trim()).filter(Boolean);
-  const isPrice=s=>/^[\d']+\.\d{2}$/.test(s.replace(/[\s']/g,'').replace(',','.'));
-  const cleanP=s=>s.replace(/'/g,'').replace(',','.').trim();
-  const isQty=s=>/^\d{1,4}$/.test(s.trim())&&Number(s)<=9999;
-  const isArtNr=s=>/^\*?\s*\d{5,7}\s*$/.test(s.trim());
-  const cleanNr=s=>s.replace(/[^\d]/g,'').trim();
+  const isPrice=s=>/^[\d']+\.\d{2}$/.test(s.replace(/[\s']/g,''));
+  const cleanP=s=>s.replace(/'/g,'').trim();
 
-  // Detect Richner: Art-Nr allein auf Zeile
-  let richnerCount=0;
-  for(let j=0;j<Math.min(30,lines.length);j++){
-    if(isArtNr(lines[j])&&j+1<lines.length&&!isArtNr(lines[j+1])&&!isPrice(lines[j+1])){
-      richnerCount++;
-    }
+  // Art-Nr Erkennung
+  // Sabag:   "890 103.508.000" → 3+Leer+3.3.3  → SGVSB = erste 6 Ziffern
+  // Richner: "791007 508 000"  → 6+Leer+3+Leer+3 → SGVSB = erste 6 Ziffern
+  const isSabagArt  = s => /^\d{3}\s+\d{3}\.\d{3}\.\d{3}$/.test(s);
+  const isRichnerArt = s => /^\d{6}\s+\d{3}\s+\d{3}$/.test(s);
+  const isArt = s => isSabagArt(s) || isRichnerArt(s);
+  const getSGVSB = s => s.replace(/[^\d]/g,'').substring(0,6);
+
+  const isPosNr = s => /^\d+\.\d{2}$/.test(s) && Number(s) < 10000;
+  // Menge-Zeile: "1.00 Stk S008 31.00 31.00" (Sabag) oder "5100 1 15.00 15.00" (Richner inline)
+  const isMengeLine = s => /^\d+\.?\d*\s+Stk\s+\w/.test(s);
+
+  // Erkennung: Sabag/Richner Offerte (Pos-Nr + Art-Nr Format)
+  let offerteCount = 0;
+  for(let j=0; j<Math.min(60,lines.length); j++){
+    if(isPosNr(lines[j]) && j+1<lines.length && isArt(lines[j+1])) offerteCount++;
   }
-  const isRichner=richnerCount>=2;
 
-  const result=[];
+  const result = [];
 
-  if(isRichner){
-    let i=0;
-    while(i<lines.length){
-      if(isArtNr(lines[i])){
-        const sgvsbNr=cleanNr(lines[i]);
-        let bez='',preis='',menge=1,j=i+1;
-        // Bezeichnung (nächste nicht-Preis, nicht-Nr Zeile)
-        if(j<lines.length&&!isArtNr(lines[j])&&!isPrice(lines[j])){
-          bez=lines[j].replace(/^\*/,'').trim();j++;
+  if(offerteCount >= 2){
+    // Sabag/Richner Offerten-Parser
+    let i = 0;
+    while(i < lines.length){
+      if(isPosNr(lines[i]) && i+1 < lines.length && isArt(lines[i+1])){
+        const artLine = lines[i+1];
+        const sgvsbNr = getSGVSB(artLine);
+        let j = i+2, bezLines = [], menge = 1, preis = '';
+
+        while(j < lines.length){
+          const l = lines[j];
+          if(isMengeLine(l)){
+            const parts = l.split(/\s+/);
+            menge = Number(parts[0]) || 1;
+            // Sabag: "1.00 Stk S008 31.00 31.00" → preis=parts[3]
+            // Richner: ähnlich
+            if(parts.length >= 4) preis = cleanP(parts[3]);
+            j++; break;
+          }
+          if(isPosNr(l) || isArt(l)) break;
+          // Überspringe Zeilen die nur Symbole/Icons sind
+          if(l.length > 2 && !/^[\|\[\]\(\)A-Z]{1,3}$/.test(l)){
+            bezLines.push(l);
+          }
+          j++;
         }
-        // Preis exkl.
-        if(j<lines.length&&isPrice(lines[j])){preis=cleanP(lines[j]);j++;}
-        // Preis inkl. überspringen
-        if(j<lines.length&&isPrice(lines[j]))j++;
-        if(sgvsbNr&&(bez||preis)){
+
+        if(sgvsbNr){
+          const bez = bezLines.join(' ').trim();
+          const row = {...emptyRow(), sgvsbNr, bezeichnung:bez, menge, konkurrenzPreis:preis, stNr:'', preis:0};
+          applyMap(row);
+          result.push(row);
+        }
+        i = j;
+      } else {
+        // Zeilen ohne Pos-Nr aber mit Menge (Pauschalen wie 169000, 900001)
+        // Format: Bezeichnung ... SGVSB Menge Preis Betrag
+        const pausM = lines[i].match(/^(.+?)\s+(\d{5,7})\s+(\d+\.?\d*)\s+([\d']+\.\d{2})\s+[\d']+\.\d{2}$/);
+        if(pausM){
+          const row = {...emptyRow(), sgvsbNr:pausM[2], bezeichnung:pausM[1].trim(), menge:Number(pausM[3])||1, konkurrenzPreis:cleanP(pausM[4]), stNr:'', preis:0};
+          applyMap(row);
+          result.push(row);
+        }
+        i++;
+      }
+    }
+    return result;
+  }
+
+  // Richner Merkliste: Art-Nr allein auf Zeile (6-stellig), dann Bez, dann Preis exkl, dann Preis inkl
+  const isShortNr = s => /^\*?\s*\d{5,7}\s*$/.test(s);
+  const cleanNr = s => s.replace(/[^\d]/g,'').trim();
+  let richnerMerk = 0;
+  for(let j=0; j<Math.min(30,lines.length); j++){
+    if(isShortNr(lines[j]) && j+1<lines.length && !isShortNr(lines[j+1]) && !isPrice(lines[j+1])) richnerMerk++;
+  }
+
+  if(richnerMerk >= 2){
+    let i = 0;
+    while(i < lines.length){
+      if(isShortNr(lines[i])){
+        const sgvsbNr = cleanNr(lines[i]);
+        let bez='', preis='', menge=1, j=i+1;
+        if(j<lines.length && !isShortNr(lines[j]) && !isPrice(lines[j])){bez=lines[j].replace(/^\*/,'').trim();j++;}
+        if(j<lines.length && isPrice(lines[j])){preis=cleanP(lines[j]);j++;}
+        if(j<lines.length && isPrice(lines[j]))j++;
+        if(sgvsbNr && (bez||preis)){
           const row={...emptyRow(),sgvsbNr,bezeichnung:bez,menge,konkurrenzPreis:preis,stNr:'',preis:0};
           applyMap(row);result.push(row);
         }
@@ -362,54 +444,34 @@ function parseCompetitorText(text){
     return result;
   }
 
-  // Sabag-Parser: sammle alle Zeilen und verbinde Art-Nr mit Preis/Menge
-  // Strategie: Art-Nr Zeile merken, dann auf allen nachfolgenden Zeilen
-  // nach "Preis Menge Betrag" Pattern suchen bis zur nächsten Art-Nr
-  let pending=null; // {sgvsbNr, bezeichnung, startLine}
+  // Sabag Merkliste (Standard): Art-Nr + Bez + Preis auf einer Zeile
+  const skipLine = s => /^Art\.?-?Nr\.|^Artikel|^Total|^Mwst|^Seite:|^Objekt:|^Datum:|^Projekt|^Preis CHF|^Betrag|^Rekapitulation|^Bonus|^Auftrags/i.test(s);
+  const isQty = s => /^\d{1,4}$/.test(s) && Number(s) <= 9999;
+  let curNr='', curBez='', curPreis='', curMenge=1, foundPreis=false;
 
-  const flush=(sgvsbNr, bez, preis, menge)=>{
-    if(!sgvsbNr) return;
-    // Bereinige Bezeichnung von Farb-/Grössenangaben am Ende
-    bez=bez.replace(/\s+\d+\s*(ohne Farbe|weiss|schwarz|verchromt|chromeline|standard|[a-z]+).*$/i,'').trim();
-    const row={...emptyRow(),sgvsbNr,bezeichnung:bez,menge,konkurrenzPreis:preis,stNr:'',preis:0};
-    applyMap(row);result.push(row);
+  const flush = () => {
+    if(!curNr) return;
+    curBez = curBez.replace(/\s+\d+\s*(ohne Farbe|weiss|schwarz|verchromt|chromeline|standard|[a-z]+).*$/i,'').trim();
+    const row = {...emptyRow(), sgvsbNr:curNr, bezeichnung:curBez, menge:curMenge, konkurrenzPreis:curPreis, stNr:'', preis:0};
+    applyMap(row); result.push(row);
   };
 
-  // Sammle alle Token-Gruppen
-  // Jede Zeile: entweder Art-Nr-Zeile, Preis-Zeile, oder Bezeichnungs-Zeile
-  let curNr='', curBez='', curPreis='', curMenge=1;
-  let foundPreis=false;
-
-  const skipLine=s=>/^Art\.?-?Nr\.|^Artikel|^Total|^Mwst|^Seite:|^Objekt:|^Datum:|^Projekt|^Preis CHF|^Betrag/i.test(s);
-
-  for(let i=0;i<lines.length;i++){
-    const line=lines[i];
+  for(let i=0; i<lines.length; i++){
+    const line = lines[i];
     if(skipLine(line)) continue;
-
-    // Art-Nr Zeile (mit oder ohne Bezeichnung dahinter)
-    const artM=line.match(/^(\d{5,7})\s*(.*)$/);
-    if(artM&&!isPrice(line)){
-      // Vorherige Position speichern
-      if(curNr) flush(curNr, curBez, curPreis, curMenge);
-      curNr=artM[1];
-      curBez=artM[2].trim();
-      curPreis='';curMenge=1;foundPreis=false;
-
-      // Preis direkt auf dieser Zeile?
-      const tokens=curBez.split(/\s+/),n=tokens.length;
+    const artM = line.match(/^(\d{5,7})\s*(.*)$/);
+    if(artM && !isPrice(line)){
+      flush();
+      curNr=artM[1]; curBez=artM[2].trim(); curPreis=''; curMenge=1; foundPreis=false;
+      const tokens=curBez.split(/\s+/), n=tokens.length;
       if(n>=3&&isPrice(tokens[n-1])&&isQty(tokens[n-2])&&isPrice(tokens[n-3])){
-        curPreis=cleanP(tokens[n-3]);curMenge=Number(tokens[n-2])||1;
-        curBez=tokens.slice(0,n-3).join(' ');foundPreis=true;
+        curPreis=cleanP(tokens[n-3]); curMenge=Number(tokens[n-2])||1; curBez=tokens.slice(0,n-3).join(' '); foundPreis=true;
       } else if(n>=2&&isPrice(tokens[n-1])&&isQty(tokens[n-2])){
-        curPreis=cleanP(tokens[n-1]);curMenge=Number(tokens[n-2])||1;
-        curBez=tokens.slice(0,n-2).join(' ');foundPreis=true;
+        curPreis=cleanP(tokens[n-1]); curMenge=Number(tokens[n-2])||1; curBez=tokens.slice(0,n-2).join(' '); foundPreis=true;
       }
       continue;
     }
-
     if(!curNr) continue;
-
-    // Preis+Menge+Betrag auf separater Zeile: "751.00 1 751.00"
     if(!foundPreis){
       const pm3=line.match(/^([\d']+\.\d{2})\s+(\d{1,4})\s+[\d']+\.\d{2}$/);
       const pm2=line.match(/^([\d']+\.\d{2})\s+(\d{1,4})$/);
@@ -419,10 +481,11 @@ function parseCompetitorText(text){
       if(pm1){curPreis=cleanP(pm1[1]);foundPreis=true;continue;}
     }
   }
-  if(curNr) flush(curNr, curBez, curPreis, curMenge);
-
+  flush();
   return result;
 }
+
+
 
 
 
@@ -486,6 +549,144 @@ async function exportPdf(){
     doc.save(`Offerte_${document.getElementById('offerteNr').value||'Entwurf'}.pdf`);
     flash('PDF exportiert.');
   }catch(err){flash('Fehler PDF-Export: '+err.message);}
+}
+
+// Suchmodal
+let searchTargetId = null;
+
+function openSearch(rowId) {
+  searchTargetId = rowId;
+  document.getElementById('searchModal').style.display = 'block';
+  document.getElementById('searchInput').value = '';
+  document.getElementById('searchResults').innerHTML = '<p style="color:#7a7466;font-size:13px;padding:8px">Suchbegriff eingeben...</p>';
+  setTimeout(() => document.getElementById('searchInput').focus(), 100);
+}
+
+function closeSearch() {
+  document.getElementById('searchModal').style.display = 'none';
+  searchTargetId = null;
+}
+
+function doSearch(q) {
+  const results = document.getElementById('searchResults');
+  if (!q || q.length < 2) {
+    results.innerHTML = '<p style="color:#7a7466;font-size:13px;padding:8px">Mindestens 2 Zeichen eingeben...</p>';
+    return;
+  }
+  const qLow = q.toLowerCase();
+  // Suche im eingebetteten Mapping
+  const hits = [];
+  const seen = new Set();
+  for (const [sgvsb, m] of Object.entries(SANITAS_MAPPING)) {
+    if (seen.has(m.stNr)) continue;
+    const inBez = m.bez.toLowerCase().includes(qLow);
+    const inSt = m.stNr.includes(q);
+    const inSgvsb = sgvsb.includes(q);
+    if (inBez || inSt || inSgvsb) {
+      hits.push({sgvsb, ...m});
+      seen.add(m.stNr);
+      if (hits.length >= 30) break;
+    }
+  }
+  if (!hits.length) {
+    results.innerHTML = '<p style="color:#7a7466;font-size:13px;padding:8px">Keine Treffer.</p>';
+    return;
+  }
+  results.innerHTML = hits.map(h => `
+    <div onclick="selectArticle('${h.stNr}','${h.sgvsb}','${h.bez.replace(/'/g,"\\'")}','${h.preis}')"
+      style="padding:10px 12px;border-bottom:1px solid #E9E4D8;cursor:pointer;hover:background:#F4F1EA"
+      onmouseover="this.style.background='#F4F1EA'" onmouseout="this.style.background='#fff'">
+      <div style="font-weight:600;font-size:13px;color:#101F2B">${h.bez}</div>
+      <div style="font-size:12px;color:#7a7466;margin-top:2px">ST-Nr: ${h.stNr} · SGVSB: ${h.sgvsb} · CHF ${h.preis}</div>
+    </div>
+  `).join('');
+}
+
+function selectArticle(stNr, sgvsb, bez, preis) {
+  if (!searchTargetId) return;
+  const row = rows.find(r => r.id === searchTargetId);
+  if (row) {
+    row.stNr = stNr;
+    if (!row.sgvsbNr) row.sgvsbNr = sgvsb;
+    if (!row.bezeichnung) row.bezeichnung = bez;
+    if (row.preis === 0) row.preis = Number(preis) || 0;
+    renderRows();
+    updateTotals();
+  }
+  closeSearch();
+}
+
+// KI-Vorschläge für nicht-gematchte Artikel
+async function suggestForRow(row) {
+  if (row.stNr || !row.bezeichnung) return;
+  
+  // Baue Kandidatenliste aus Mapping (max 200 für KI-Kontext)
+  const candidates = Object.entries(SANITAS_MAPPING).slice(0, 200).map(([sgvsb, m]) => 
+    `SGVSB:${sgvsb} ST:${m.stNr} Bez:${m.bez} CHF ${m.preis}`
+  ).join('\n');
+
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 1000,
+        messages: [{
+          role: 'user',
+          content: `Du bist ein Sanitär-Experte. Finde aus der Sanitas Trösch Artikelliste die bis zu 10 besten Alternativen zum Konkurrenzartikel.
+
+Konkurrenzartikel: "${row.bezeichnung}" (SGVSB: ${row.sgvsbNr})
+
+Sanitas Trösch Artikel (Auswahl):
+${candidates}
+
+Antworte NUR mit JSON-Array, keine andere Text:
+[{"sgvsb":"...","stNr":"...","bez":"...","preis":"..."}]`
+        }]
+      })
+    });
+    const data = await response.json();
+    const text = data.content?.[0]?.text || '[]';
+    const clean = text.replace(/\`\`\`json|\`\`\`/g, '').trim();
+    return JSON.parse(clean);
+  } catch(e) {
+    return [];
+  }
+}
+
+async function autoSuggest(rowId) {
+  const row = rows.find(r => r.id === rowId);
+  if (!row || row.stNr) return;
+  
+  flash('KI sucht passende Sanitas Artikel...', 0);
+  const suggestions = await suggestForRow(row);
+  
+  if (!suggestions || !suggestions.length) {
+    flash('Keine KI-Vorschläge gefunden. Bitte manuell suchen.', 4000);
+    openSearch(rowId);
+    return;
+  }
+  
+  // Zeige Vorschläge im Suchmodal
+  searchTargetId = rowId;
+  document.getElementById('searchModal').style.display = 'block';
+  document.getElementById('searchInput').value = row.bezeichnung;
+  
+  const results = document.getElementById('searchResults');
+  results.innerHTML = `
+    <p style="font-size:12px;color:#B98A4E;padding:8px;margin:0;border-bottom:1px solid #E9E4D8">
+      🤖 KI-Vorschläge für: <strong>${row.bezeichnung}</strong>
+    </p>
+    ${suggestions.map(h => `
+    <div onclick="selectArticle('${h.stNr}','${h.sgvsb}','${(h.bez||'').replace(/'/g,"\\'")}','${h.preis}')"
+      style="padding:10px 12px;border-bottom:1px solid #E9E4D8;cursor:pointer"
+      onmouseover="this.style.background='#F4F1EA'" onmouseout="this.style.background='#fff'">
+      <div style="font-weight:600;font-size:13px;color:#101F2B">${h.bez}</div>
+      <div style="font-size:12px;color:#7a7466;margin-top:2px">ST-Nr: ${h.stNr} · SGVSB: ${h.sgvsb} · CHF ${h.preis}</div>
+    </div>`).join('')}
+  `;
+  flash('', 0);
 }
 
 // Init
