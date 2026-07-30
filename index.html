@@ -351,82 +351,99 @@ async function handlePdf(input){
 }
 
 function parseCompetitorText(text){
-  const lines=text.split('\n').map(l=>l.trim()).filter(Boolean);
-  const isPrice=s=>/^[\d']+\.\d{2}$/.test(s.replace(/[\s']/g,''));
-  const cleanP=s=>s.replace(/'/g,'').trim();
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  const cleanP = s => s.replace(/'/g,'').replace(/\s/g,'').replace(/o/gi, s=>s==='o'||s==='O'?'0':s);
+  const isPrice = s => /^[\d']+\.\d{2}$/.test(s.replace(/[\s']/g,''));
+  const result = [];
 
-  // Art-Nr Erkennung
-  // Sabag:   "890 103.508.000" → 3+Leer+3.3.3  → SGVSB = erste 6 Ziffern
-  // Richner: "791007 508 000"  → 6+Leer+3+Leer+3 → SGVSB = erste 6 Ziffern
-  const isSabagArt  = s => /^\d{3}\s+\d{3}\.\d{3}\.\d{3}$/.test(s);
+  // Format 1: INLINE Sabag/Richner Offerte
+  // "30.00  890 103.508.000  1.00 Stk  S008  31.00  31.00"
+  // "40.00  791007 508 000  1.00  5100  32.00  32.00" (Richner)
+  const inlineSabag = /^(\d+\.\d{2})\s+(\d{3}\s+\d{3}\.\d{3}\.\d{3})\s+(\d+\.?\d*)\s+Stk\s+\w+\s+([\d'.\s]+?)\s+[\d'.]+$/i;
+  const inlineRichner = /^(\d+\.\d{2})\s+(\d{6}\s+\d{3}\s+\d{3})\s+(\d+\.?\d*)\s+\d+\s+\*?\s*([\d'.]+)\s+[\d'.]+$/;
+
+  // Format 2: Pos-Nr auf eigener Zeile, dann Art-Nr auf nächster
+  const isPosNr = s => /^\d+\.\d{2}$/.test(s) && Number(s) < 10000;
+  const isSabagArt = s => /^\d{3}\s+\d{3}\.\d{3}\.\d{3}$/.test(s);
   const isRichnerArt = s => /^\d{6}\s+\d{3}\s+\d{3}$/.test(s);
   const isArt = s => isSabagArt(s) || isRichnerArt(s);
   const getSGVSB = s => s.replace(/[^\d]/g,'').substring(0,6);
+  const isMengeLine = s => /^\d+\.?\d*\s+Stk\s+\w/i.test(s);
 
-  const isPosNr = s => /^\d+\.\d{2}$/.test(s) && Number(s) < 10000;
-  // Menge-Zeile: "1.00 Stk S008 31.00 31.00" (Sabag) oder "5100 1 15.00 15.00" (Richner inline)
-  const isMengeLine = s => /^\d+\.?\d*\s+Stk\s+\w/.test(s);
-
-  // Erkennung: Sabag/Richner Offerte (Pos-Nr + Art-Nr Format)
-  let offerteCount = 0;
-  for(let j=0; j<Math.min(60,lines.length); j++){
-    if(isPosNr(lines[j]) && j+1<lines.length && isArt(lines[j+1])) offerteCount++;
+  // Zähle Inline-Treffer
+  let inlineCount = 0, multilineCount = 0;
+  for(let j = 0; j < Math.min(60, lines.length); j++){
+    if(inlineSabag.test(lines[j]) || inlineRichner.test(lines[j])) inlineCount++;
+    if(isPosNr(lines[j]) && j+1 < lines.length && isArt(lines[j+1])) multilineCount++;
   }
 
-  const result = [];
+  if(inlineCount >= 2 || (inlineCount >= 1 && multilineCount === 0)){
+    // INLINE Parser
+    for(let i = 0; i < lines.length; i++){
+      const line = lines[i];
+      let m = line.match(inlineSabag) || line.match(inlineRichner);
 
-  if(offerteCount >= 2){
-    // Sabag/Richner Offerten-Parser
+      // Auch ohne "Stk" versuchen: "30.00 890 103.508.000 1.00 Stk s008 31.00 31.00"
+      if(!m){
+        const flex = line.match(/^(\d+\.\d{2})\s+(\d{3}\s+\d{3}[.\/]\d{3}[.\/]\d{3})\s+([\d.]+)\s+Stk\s+\S+\s+([\d'.]+)\s+[\d'.]+/i)
+                  || line.match(/^(\d+\.\d{2})\s+(\d{6}\s+\d{3}\s+\d{3})\s+([\d.]+)\s+\d+\s+\*?\s*([\d'.]+)\s+[\d'.]+/);
+        if(flex) m = flex;
+      }
+
+      if(m){
+        const sgvsbNr = getSGVSB(m[2]);
+        const menge = Number(m[3]) || 1;
+        const preis = cleanP(m[4]);
+        // Bezeichnung: nächste Zeilen bis zur nächsten Pos-Nr
+        const bezLines = [];
+        let j = i + 1;
+        while(j < lines.length && !isPosNr(lines[j]) && !inlineSabag.test(lines[j]) && !inlineRichner.test(lines[j])){
+          const l = lines[j].trim();
+          if(l && !/^Übertrag|^Seite|^Angebot|^Pos\.|^Art\./i.test(l)) bezLines.push(l);
+          j++;
+        }
+        const bezeichnung = bezLines.slice(0,3).join(' ').trim();
+        const row = {...emptyRow(), sgvsbNr, bezeichnung, menge, konkurrenzPreis: preis, stNr:'', preis:0};
+        applyMap(row);
+        result.push(row);
+      }
+    }
+    if(result.length > 0) return result;
+  }
+
+  if(multilineCount >= 2){
+    // MULTILINE Parser (Pos-Nr + Art-Nr auf separaten Zeilen)
     let i = 0;
     while(i < lines.length){
       if(isPosNr(lines[i]) && i+1 < lines.length && isArt(lines[i+1])){
-        const artLine = lines[i+1];
-        const sgvsbNr = getSGVSB(artLine);
+        const sgvsbNr = getSGVSB(lines[i+1]);
         let j = i+2, bezLines = [], menge = 1, preis = '';
-
         while(j < lines.length){
           const l = lines[j];
           if(isMengeLine(l)){
             const parts = l.split(/\s+/);
             menge = Number(parts[0]) || 1;
-            // Sabag: "1.00 Stk S008 31.00 31.00" → preis=parts[3]
-            // Richner: ähnlich
             if(parts.length >= 4) preis = cleanP(parts[3]);
             j++; break;
           }
           if(isPosNr(l) || isArt(l)) break;
-          // Überspringe Zeilen die nur Symbole/Icons sind
-          if(l.length > 2 && !/^[\|\[\]\(\)A-Z]{1,3}$/.test(l)){
-            bezLines.push(l);
-          }
+          if(l.length > 2 && !/^[\|\[\]]{1,3}$/.test(l)) bezLines.push(l);
           j++;
         }
-
         if(sgvsbNr){
-          const bez = bezLines.join(' ').trim();
-          const row = {...emptyRow(), sgvsbNr, bezeichnung:bez, menge, konkurrenzPreis:preis, stNr:'', preis:0};
-          applyMap(row);
-          result.push(row);
+          const row = {...emptyRow(), sgvsbNr, bezeichnung: bezLines.join(' ').trim(), menge, konkurrenzPreis: preis, stNr:'', preis:0};
+          applyMap(row); result.push(row);
         }
         i = j;
-      } else {
-        // Zeilen ohne Pos-Nr aber mit Menge (Pauschalen wie 169000, 900001)
-        // Format: Bezeichnung ... SGVSB Menge Preis Betrag
-        const pausM = lines[i].match(/^(.+?)\s+(\d{5,7})\s+(\d+\.?\d*)\s+([\d']+\.\d{2})\s+[\d']+\.\d{2}$/);
-        if(pausM){
-          const row = {...emptyRow(), sgvsbNr:pausM[2], bezeichnung:pausM[1].trim(), menge:Number(pausM[3])||1, konkurrenzPreis:cleanP(pausM[4]), stNr:'', preis:0};
-          applyMap(row);
-          result.push(row);
-        }
-        i++;
-      }
+      } else { i++; }
     }
-    return result;
+    if(result.length > 0) return result;
   }
 
-  // Richner Merkliste: Art-Nr allein auf Zeile (6-stellig), dann Bez, dann Preis exkl, dann Preis inkl
+  // MERKLISTE Parser (6-stellige Art-Nr allein oder mit Text + Preis)
   const isShortNr = s => /^\*?\s*\d{5,7}\s*$/.test(s);
   const cleanNr = s => s.replace(/[^\d]/g,'').trim();
+  const isQty = s => /^\d{1,4}$/.test(s) && Number(s) <= 9999;
   let richnerMerk = 0;
   for(let j=0; j<Math.min(30,lines.length); j++){
     if(isShortNr(lines[j]) && j+1<lines.length && !isShortNr(lines[j+1]) && !isPrice(lines[j+1])) richnerMerk++;
@@ -437,12 +454,12 @@ function parseCompetitorText(text){
     while(i < lines.length){
       if(isShortNr(lines[i])){
         const sgvsbNr = cleanNr(lines[i]);
-        let bez='', preis='', menge=1, j=i+1;
+        let bez='', preis='', j=i+1;
         if(j<lines.length && !isShortNr(lines[j]) && !isPrice(lines[j])){bez=lines[j].replace(/^\*/,'').trim();j++;}
         if(j<lines.length && isPrice(lines[j])){preis=cleanP(lines[j]);j++;}
         if(j<lines.length && isPrice(lines[j]))j++;
         if(sgvsbNr && (bez||preis)){
-          const row={...emptyRow(),sgvsbNr,bezeichnung:bez,menge,konkurrenzPreis:preis,stNr:'',preis:0};
+          const row={...emptyRow(),sgvsbNr,bezeichnung:bez,menge:1,konkurrenzPreis:preis,stNr:'',preis:0};
           applyMap(row);result.push(row);
         }
         i=j;
@@ -451,18 +468,14 @@ function parseCompetitorText(text){
     return result;
   }
 
-  // Sabag Merkliste (Standard): Art-Nr + Bez + Preis auf einer Zeile
-  const skipLine = s => /^Art\.?-?Nr\.|^Artikel|^Total|^Mwst|^Seite:|^Objekt:|^Datum:|^Projekt|^Preis CHF|^Betrag|^Rekapitulation|^Bonus|^Auftrags/i.test(s);
-  const isQty = s => /^\d{1,4}$/.test(s) && Number(s) <= 9999;
+  // SABAG MERKLISTE (Art-Nr + Bez + Preis + Menge auf einer Zeile)
+  const skipLine = s => /^Art\.?-?Nr\.|^Total|^Mwst|^Seite:|^Objekt:|^Preis CHF|^Betrag|^Rekapitulation|^Bonus/i.test(s);
   let curNr='', curBez='', curPreis='', curMenge=1, foundPreis=false;
-
   const flush = () => {
     if(!curNr) return;
-    curBez = curBez.replace(/\s+\d+\s*(ohne Farbe|weiss|schwarz|verchromt|chromeline|standard|[a-z]+).*$/i,'').trim();
     const row = {...emptyRow(), sgvsbNr:curNr, bezeichnung:curBez, menge:curMenge, konkurrenzPreis:curPreis, stNr:'', preis:0};
     applyMap(row); result.push(row);
   };
-
   for(let i=0; i<lines.length; i++){
     const line = lines[i];
     if(skipLine(line)) continue;
@@ -472,9 +485,9 @@ function parseCompetitorText(text){
       curNr=artM[1]; curBez=artM[2].trim(); curPreis=''; curMenge=1; foundPreis=false;
       const tokens=curBez.split(/\s+/), n=tokens.length;
       if(n>=3&&isPrice(tokens[n-1])&&isQty(tokens[n-2])&&isPrice(tokens[n-3])){
-        curPreis=cleanP(tokens[n-3]); curMenge=Number(tokens[n-2])||1; curBez=tokens.slice(0,n-3).join(' '); foundPreis=true;
+        curPreis=cleanP(tokens[n-3]);curMenge=Number(tokens[n-2])||1;curBez=tokens.slice(0,n-3).join(' ');foundPreis=true;
       } else if(n>=2&&isPrice(tokens[n-1])&&isQty(tokens[n-2])){
-        curPreis=cleanP(tokens[n-1]); curMenge=Number(tokens[n-2])||1; curBez=tokens.slice(0,n-2).join(' '); foundPreis=true;
+        curPreis=cleanP(tokens[n-1]);curMenge=Number(tokens[n-2])||1;curBez=tokens.slice(0,n-2).join(' ');foundPreis=true;
       }
       continue;
     }
@@ -491,6 +504,7 @@ function parseCompetitorText(text){
   flush();
   return result;
 }
+
 
 
 
