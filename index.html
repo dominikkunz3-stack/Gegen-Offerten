@@ -359,6 +359,9 @@ function parseCompetitorText(text){
   const isPrice = s => /^[\d']+\.\d{2}$/.test(s.replace(/[\s']/g,''));
   const result = [];
 
+  // Überspringe Rekapitulations-Zeilen
+  const skipKeywords = /^Rekapitulation|^Bonus|^Auftragssumme|^Transport|^Total|^MWST|^Übertrag|^Seite|^Angebot|^Pos\.|^Art\.-Nr/i;
+
   // Format 1: INLINE Sabag/Richner Offerte
   // "30.00  890 103.508.000  1.00 Stk  S008  31.00  31.00"
   // "40.00  791007 508 000  1.00  5100  32.00  32.00" (Richner)
@@ -376,27 +379,28 @@ function parseCompetitorText(text){
   // Zähle Inline-Treffer
   let inlineCount = 0, multilineCount = 0;
   for(let j = 0; j < Math.min(60, lines.length); j++){
-    if(inlineSabag.test(lines[j]) || inlineRichner.test(lines[j])) inlineCount++;
+    if(/^\d+\.\d{2}\s+\d{3}[\s.]\d{3}/.test(lines[j])) inlineCount++;
     if(isPosNr(lines[j]) && j+1 < lines.length && isArt(lines[j+1])) multilineCount++;
   }
 
   if(inlineCount >= 2 || (inlineCount >= 1 && multilineCount === 0)){
-    // INLINE Parser
+    // INLINE Parser - flexibel für Sabag/Richner DOCX und PDF
     for(let i = 0; i < lines.length; i++){
-      const line = lines[i];
-      let m = line.match(inlineSabag) || line.match(inlineRichner);
-
-      // Auch ohne "Stk" versuchen: "30.00 890 103.508.000 1.00 Stk s008 31.00 31.00"
-      if(!m){
-        const flex = line.match(/^(\d+\.\d{2})\s+(\d{3}\s+\d{3}[.\/]\d{3}[.\/]\d{3})\s+([\d.]+)\s+Stk\s+\S+\s+([\d'.]+)\s+[\d'.]+/i)
-                  || line.match(/^(\d+\.\d{2})\s+(\d{6}\s+\d{3}\s+\d{3})\s+([\d.]+)\s+\d+\s+\*?\s*([\d'.]+)\s+[\d'.]+/);
-        if(flex) m = flex;
-      }
+      const line = lines[i].replace(/\t/g,' ');
+      // Generisches Muster: POS_NR  ART_NR  [MENGE Stk]  BONUS  PREIS  BETRAG
+      // Sabag DOCX: "30.00  890 103.508.000  1.00 Stk  s008  31.00  31.00"
+      // Richner:     "40.00  791007 508 000  5100  1  32.00  32.00"
+      if(skipKeywords.test(line)) continue;
+      const m = line.match(/^(\d+\.\d{2})\s+(\d{3}[\s.]\d{3}[.\s]\d{3}[.\s]\d{3})\s+(?:(\d+\.?\d*)\s+[Ss]tk\s+)?([A-Za-z0-9]\w*)\s+([\d'.oO\s]+?)\s+[\d'.oO\s]+$/)
+             || line.match(/^(\d+\.\d{2})\s+(\d{6}\s+\d{3}\s+\d{3})\s+(?:(\d+\.?\d*)\s+)?\d{4}\s+\*?\s*(\d+)\s+([\d'.]+)\s+[\d'.]+$/);
 
       if(m){
         const sgvsbNr = getSGVSB(m[2]);
+        if(!sgvsbNr || sgvsbNr.length < 5) continue; // Überspringe ungültige Art-Nr
         const menge = Number(m[3]) || 1;
-        const preis = cleanP(m[4]);
+        const preis = cleanP(m[5]);
+        // Überspringe wenn Preis unrealistisch hoch (Zwischentotale)
+        if(Number(preis) > 9999) continue;
         // Bezeichnung: nächste Zeilen bis zur nächsten Pos-Nr
         const bezLines = [];
         let j = i + 1;
@@ -673,9 +677,34 @@ function selectArticle(stNr, sgvsb, bez, preis) {
 async function suggestForRow(row) {
   if (row.stNr || !row.bezeichnung) return;
   
-  // Baue Kandidatenliste aus Mapping (max 200 für KI-Kontext)
-  const candidates = Object.entries(SANITAS_MAPPING).slice(0, 200).map(([sgvsb, m]) => 
-    `SGVSB:${sgvsb} ST:${m.stNr} Bez:${m.bez} CHF ${m.preis}`
+  // Smarte Vorauswahl: Filtere Sanitas-Artikel nach Schlüsselwörtern aus der Bezeichnung
+  const keywords = row.bezeichnung.toLowerCase()
+    .replace(/[^a-zäöü0-9\s]/gi, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 3)
+    .slice(0, 5);
+  
+  // Filtere aus dem Mapping nach Keywords
+  let candidates = [];
+  const allEntries = Object.entries(SANITAS_MAPPING);
+  
+  for(const [sgvsb, m] of allEntries){
+    const bezLow = (m.bez || '').toLowerCase();
+    const score = keywords.filter(k => bezLow.includes(k)).length;
+    if(score > 0) candidates.push({score, sgvsb, ...m});
+  }
+  
+  // Sortiere nach Score, nehme Top 50
+  candidates.sort((a,b) => b.score - a.score);
+  candidates = candidates.slice(0, 50);
+  
+  // Falls keine Treffer, nehme erste 50 aus Mapping
+  if(!candidates.length){
+    candidates = allEntries.slice(0, 50).map(([sgvsb, m]) => ({sgvsb, ...m}));
+  }
+  
+  const candidateText = candidates.map(c => 
+    `SGVSB:${c.sgvsb} ST:${c.stNr} Bez:${c.bez} CHF ${c.preis}`
   ).join('\n');
 
   try {
@@ -687,14 +716,21 @@ async function suggestForRow(row) {
         max_tokens: 1000,
         messages: [{
           role: 'user',
-          content: `Du bist ein Sanitär-Experte. Finde aus der Sanitas Trösch Artikelliste die bis zu 10 besten Alternativen zum Konkurrenzartikel.
+          content: `Du bist ein Sanitär-Experte bei Sanitas Trösch Schweiz. Finde die bis zu 10 besten vergleichbaren Artikel aus dem Sanitas Trösch Sortiment zum gegebenen Konkurrenzartikel.
 
-Konkurrenzartikel: "${row.bezeichnung}" (SGVSB: ${row.sgvsbNr})
+Konkurrenzartikel: "${row.bezeichnung}"
+SGVSB-Nr: ${row.sgvsbNr}
+Konkurrenzpreis: CHF ${row.konkurrenzPreis}
 
-Sanitas Trösch Artikel (Auswahl):
-${candidates}
+Sanitas Trösch Sortiment (vorgefilterter Ausschnitt):
+${candidateText}
 
-Antworte NUR mit JSON-Array, keine andere Text:
+Wähle die ähnlichsten Artikel basierend auf:
+- Produkttyp (z.B. Badewanne, Armatur, Sifon)
+- Grösse/Masse wenn angegeben
+- Funktion und Ausführung
+
+Antworte NUR mit JSON-Array ohne weiteren Text:
 [{"sgvsb":"...","stNr":"...","bez":"...","preis":"..."}]`
         }]
       })
